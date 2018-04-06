@@ -58,8 +58,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-
 import argparse
+
+import tensorflow as tf
 
 
 class BaseParser(argparse.ArgumentParser):
@@ -78,7 +79,7 @@ class BaseParser(argparse.ArgumentParser):
 
   def __init__(self, add_help=False, data_dir=True, model_dir=True,
                train_epochs=True, epochs_between_evals=True, batch_size=True,
-               multi_gpu=True, hooks=True):
+               multi_gpu=True, num_gpu=True, hooks=True):
     super(BaseParser, self).__init__(add_help=add_help)
 
     if data_dir:
@@ -118,11 +119,22 @@ class BaseParser(argparse.ArgumentParser):
           metavar="<BS>"
       )
 
-    # TODO(taylorrobie@): deprecate and only use DistributionStrategies
+    assert not (multi_gpu and num_gpu)
+
     if multi_gpu:
       self.add_argument(
           "--multi_gpu", action="store_true",
           help="If set, run across all available GPUs."
+      )
+
+    if num_gpu:
+      self.add_argument(
+          "--num_gpus", "-ng",
+          type=int,
+          default=1 if tf.test.is_built_with_cuda() else 0,
+          help="[default: %(default)s] How many GPUs to use with the "
+               "DistributionStrategies API.",
+          metavar="<NG>"
       )
 
     if hooks:
@@ -152,7 +164,6 @@ class PerformanceParser(argparse.ArgumentParser):
                intra_op=True, use_synthetic_data=True, max_train_steps=True):
     super(PerformanceParser, self).__init__(add_help=add_help)
 
-    # TODO(taylorrobie@): deprecate and only use DistributionStrategies
     if num_parallel_calls:
       self.add_argument(
           "--num_parallel_calls", "-npc",
@@ -202,33 +213,6 @@ class PerformanceParser(argparse.ArgumentParser):
                "flag.",
           metavar="<MTS>"
       )
-
-
-class DistributionStrategiesParser(argparse.ArgumentParser):
-  """Parser to add flags need for distribution strategies.
-
-  Args:
-    add_help: Create the "--help" flag. False if class instance is a parent.
-    batch_size: Create a flag to specify the batch size. (Instead of the one
-      in BaseParser)
-  """
-
-  def __init__(self, add_help=False):
-    super(DistributionStrategiesParser, self).__init__(add_help=add_help)
-
-    self.add_argument(
-        "--use_distribution_strategy", "-uds",
-        action="store_true",
-        help="If set, use the DistributionStrategies API."
-    )
-
-    self.add_argument(
-        "--gpus_for_distribution_strategy", "-gds",
-        type=int, default=2,
-        help="[default: %(default)s] How many GPUs to use with the "
-             "DistributionStrategies API.",
-        metavar="<GDS>"
-    )
 
 
 class ImageModelParser(argparse.ArgumentParser):

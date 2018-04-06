@@ -103,9 +103,7 @@ def preprocess_image(image, is_training):
   return image
 
 
-def input_fn(is_training, data_dir, batch_size, num_epochs=1,
-             use_distribution_strategy=False,
-             gpus_for_distribution_strategy=1):
+def input_fn(is_training, data_dir, batch_size, num_epochs=1):
   """Input_fn using the tf.data input pipeline for CIFAR-10 dataset.
 
   Args:
@@ -113,9 +111,6 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
     data_dir: The directory containing the input data.
     batch_size: The number of samples per batch.
     num_epochs: The number of epochs to repeat the dataset.
-    use_distribution_strategy: Whether DistributionStrategies API is used.
-    gpus_for_distribution_strategy: How many GPUs are used with
-      DistributionStrategies.
 
   Returns:
     A dataset that can be used for iteration.
@@ -123,14 +118,9 @@ def input_fn(is_training, data_dir, batch_size, num_epochs=1,
   filenames = get_filenames(is_training, data_dir)
   dataset = tf.data.FixedLengthRecordDataset(filenames, _RECORD_BYTES)
 
-  num_images = is_training and _NUM_IMAGES['train'] or _NUM_IMAGES['validation']
-
   return resnet_run_loop.process_record_dataset(
       dataset, is_training, batch_size, _NUM_IMAGES['train'],
       parse_record, num_epochs,
-      examples_per_epoch=num_images,
-      use_distribution_strategy=use_distribution_strategy,
-      gpus_for_distribution_strategy=gpus_for_distribution_strategy
   )
 
 

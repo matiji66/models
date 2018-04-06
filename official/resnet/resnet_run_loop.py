@@ -26,27 +26,20 @@ from __future__ import print_function
 import argparse
 import os
 
-# pylint: disable=g-bad-import-order
-import tensorflow as tf
-from tensorflow.contrib.distribute.python import mirrored_strategy
-from tensorflow.contrib.distribute.python import one_device_strategy
-from tensorflow.python.training import distribute as distribute_lib
+import tensorflow as tf  # pylint: disable=g-bad-import-order
 
 from official.resnet import resnet_model
 from official.utils.arg_parsers import parsers
 from official.utils.export import export
 from official.utils.logs import hooks_helper
 from official.utils.logs import logger
-# pylint: enable=g-bad-import-order
 
 
 ################################################################################
 # Functions for input processing.
 ################################################################################
 def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
-                           parse_record_fn, num_epochs=1, examples_per_epoch=0,
-                           use_distribution_strategy=False,
-                           gpus_for_distribution_strategy=1):
+                           parse_record_fn, num_epochs=1):
   """Given a Dataset with raw records, return an iterator over the records.
 
   Args:
@@ -59,27 +52,14 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
     parse_record_fn: A function that takes a raw record and returns the
       corresponding (image, label) pair.
     num_epochs: The number of epochs to repeat the dataset.
-    examples_per_epoch: The number of examples in the current set that
-      are processed each epoch. Note that this is only used for multi-GPU mode,
-      and only to handle what will eventually be handled inside of Estimator.
-    use_distribution_strategy: Whether DistributionStrategies API is used.
-    gpus_for_distribution_strategy: How many GPUs are used with
-      DistributionStrategies.
 
   Returns:
     Dataset of (image, label) pairs ready for iteration.
   """
 
-  # TODO(taylorrobie@) remove when DistributionStrategies uses global batch size
-  per_device_batch_size = compute_per_device_batch_size(
-      batch_size=batch_size,
-      use_distribution_strategy=use_distribution_strategy,
-      gpus_for_distribution_strategy=gpus_for_distribution_strategy
-  )
-
   # We prefetch a batch at a time, This can help smooth out the time taken to
   # load input files as we go through shuffling and processing.
-  dataset = dataset.prefetch(buffer_size=per_device_batch_size)
+  dataset = dataset.prefetch(buffer_size=batch_size)
   if is_training:
     # Shuffle the records. Note that we shuffle before repeating to ensure
     # that the shuffling respects epoch boundaries.
@@ -89,24 +69,11 @@ def process_record_dataset(dataset, is_training, batch_size, shuffle_buffer,
   # dataset for the appropriate number of epochs.
   dataset = dataset.repeat(num_epochs)
 
-  # Currently, if we are using multiple GPUs, we can't pass in uneven batches.
-  # (For example, if we have 4 GPUs, the number of examples in each batch
-  # must be divisible by 4.) We already ensured this for the batch_size, but
-  # we have to additionally ensure that any "leftover" examples-- the remainder
-  # examples (total examples % batch_size) that get called a batch for the very
-  # last batch of an epoch-- do not raise an error when we try to split them
-  # over the GPUs. This will likely be handled by Estimator during replication
-  # in the future, but for now, we just drop the leftovers here.
-  if use_distribution_strategy:
-    total_examples = num_epochs * examples_per_epoch
-    dataset = dataset.take(
-        per_device_batch_size * (total_examples // per_device_batch_size))
-
   # Parse the raw records into images and labels
   dataset = dataset.apply(
       tf.contrib.data.map_and_batch(
           lambda value: parse_record_fn(value, is_training),
-          batch_size=per_device_batch_size,
+          batch_size=batch_size,
           num_parallel_batches=1))
 
   # Operations between the final prefetch and the get_next call to the iterator
@@ -135,18 +102,9 @@ def get_synth_input_fn(height, width, num_channels, num_classes):
     An input_fn that can be used in place of a real one to return a dataset
     that can be used for iteration.
   """
-  def input_fn(is_training, data_dir, batch_size,  # pylint: disable=unused-argument, missing-docstring
-               use_distribution_strategy=False,
-               gpus_for_distribution_strategy=1, *args, **kwargs):  # pylint: disable=unused-argument
-    # TODO(taylorrobie@) cull DistributionStrategies uses global batch size
-    per_device_batch_size = compute_per_device_batch_size(
-        batch_size=batch_size,
-        use_distribution_strategy=use_distribution_strategy,
-        gpus_for_distribution_strategy=gpus_for_distribution_strategy
-    )
-    images = tf.zeros(
-        (per_device_batch_size, height, width, num_channels), tf.float32)
-    labels = tf.zeros((per_device_batch_size, num_classes), tf.int32)
+  def input_fn(is_training, data_dir, batch_size, *args, **kwargs):  # pylint: disable=unused-argument,missing-docstring
+    images = tf.zeros((batch_size, height, width, num_channels), tf.float32)
+    labels = tf.zeros((batch_size, num_classes), tf.int32)
     return tf.data.Dataset.from_tensors((images, labels)).repeat()
 
   return input_fn
@@ -288,11 +246,12 @@ def resnet_model_fn(features, labels, mode, model_class,
   else:
     train_op = None
 
-  if not distribute_lib.has_distribution_strategy():
+  if not tf.contrib.distribute.has_distribution_strategy():
     accuracy = tf.metrics.accuracy(
         tf.argmax(labels, axis=1), predictions['classes'])
   else:
-    # Metrics are currently not compatible with distribution strategies
+    # Metrics are currently not compatible with distribution strategies during
+    # training. This does not affect the overall performance of the model.
     accuracy = (tf.no_op(), tf.constant(0))
 
   metrics = {'accuracy': accuracy}
@@ -309,8 +268,7 @@ def resnet_model_fn(features, labels, mode, model_class,
       eval_metric_ops=metrics)
 
 
-def compute_per_device_batch_size(batch_size, use_distribution_strategy,
-                                  gpus_for_distribution_strategy):
+def per_device_batch_size(batch_size, num_gpus):
   """For multi-gpu, batch-size must be a multiple of the number of GPUs.
 
   Note that this should eventually be handled by DistributionStrategies
@@ -318,10 +276,9 @@ def compute_per_device_batch_size(batch_size, use_distribution_strategy,
   so doing the work here until that feature is in place.
 
   Args:
-    batch_size: Global batch size to be divided among devices.
-    use_distribution_strategy: Whether DistributionStrategies API is used.
-    gpus_for_distribution_strategy: How many GPUs are used with
-      DistributionStrategies.
+    batch_size: Global batch size to be divided among devices. This should be
+      equal to num_gpus times the single-GPU batch_size for multi-gpu training.
+    num_gpus: How many GPUs are used with DistributionStrategies.
 
   Returns:
     Batch size per device.
@@ -329,17 +286,17 @@ def compute_per_device_batch_size(batch_size, use_distribution_strategy,
   Raises:
     ValueError: if batch_size is not divisible by number of devices
   """
-  if use_distribution_strategy and gpus_for_distribution_strategy > 1:
-    remainder = batch_size % gpus_for_distribution_strategy
-    if remainder:
-      err = ('When running with multiple GPUs, batch size '
-             'must be a multiple of the number of available GPUs. Found {} '
-             'GPUs with a batch size of {}; try --batch_size={} instead.'
-            ).format(gpus_for_distribution_strategy, batch_size,
-                     batch_size - remainder)
-      raise ValueError(err)
-    return int(batch_size / gpus_for_distribution_strategy)
-  return batch_size
+  if num_gpus <= 1:
+    return batch_size
+
+  remainder = batch_size % num_gpus
+  if remainder:
+    err = ('When running with multiple GPUs, batch size '
+           'must be a multiple of the number of available GPUs. Found {} '
+           'GPUs with a batch size of {}; try --batch_size={} instead.'
+          ).format(num_gpus, batch_size, batch_size - remainder)
+    raise ValueError(err)
+  return int(batch_size / num_gpus)
 
 
 def resnet_main(flags, model_function, input_function, shape=None):
@@ -369,23 +326,17 @@ def resnet_main(flags, model_function, input_function, shape=None):
       intra_op_parallelism_threads=flags.intra_op_parallelism_threads,
       allow_soft_placement=True)
 
-  # Set up a RunConfig to save checkpoint and set session config.
-  if not flags.use_distribution_strategy:
-    run_config = tf.estimator.RunConfig().replace(
-        save_checkpoints_secs=1e9, session_config=session_config)
+  if flags.num_gpus == 0:
+    distribution = tf.contrib.distribute.OneDeviceStrategy('device:CPU:0')
+  elif flags.num_gpus == 1:
+    distribution = tf.contrib.distribute.OneDeviceStrategy('device:GPU:0')
   else:
-    if flags.gpus_for_distribution_strategy == 0:
-      distribution = one_device_strategy.OneDeviceStrategy(
-          'device:CPU:0')
-    elif flags.gpus_for_distribution_strategy == 1:
-      distribution = one_device_strategy.OneDeviceStrategy(
-          'device:GPU:0')
-    else:
-      distribution = mirrored_strategy.MirroredStrategy(
-          num_gpus=flags.gpus_for_distribution_strategy
-      )
-    run_config = tf.estimator.RunConfig(distribute=distribution).replace(
-        save_checkpoints_secs=1e9, session_config=session_config)
+    distribution = tf.contrib.distribute.MirroredStrategy(
+        num_gpus=flags.num_gpus
+    )
+
+  run_config = tf.estimator.RunConfig(train_distribute=distribution,
+                                      session_config=session_config)
 
   classifier = tf.estimator.Estimator(
       model_fn=model_function, model_dir=flags.model_dir, config=run_config,
@@ -414,10 +365,8 @@ def resnet_main(flags, model_function, input_function, shape=None):
       return input_function(
           is_training=True,
           data_dir=flags.data_dir,
-          batch_size=flags.batch_size,
+          batch_size=per_device_batch_size(flags.batch_size, flags.num_gpus),
           num_epochs=flags.epochs_between_evals,
-          use_distribution_strategy=flags.use_distribution_strategy,
-          gpus_for_distribution_strategy=flags.gpus_for_distribution_strategy
       )
 
     classifier.train(input_fn=input_fn_train, hooks=train_hooks,
@@ -429,9 +378,8 @@ def resnet_main(flags, model_function, input_function, shape=None):
       return input_function(
           is_training=False,
           data_dir=flags.data_dir,
-          batch_size=flags.batch_size,
+          batch_size=per_device_batch_size(flags.batch_size, flags.num_gpus),
           num_epochs=1,
-          use_distribution_strategy=False
       )
 
     # flags.max_train_steps is generally associated with testing and profiling.
@@ -460,7 +408,6 @@ class ResnetArgParser(argparse.ArgumentParser):
   def __init__(self, resnet_size_choices=None):
     super(ResnetArgParser, self).__init__(parents=[
         parsers.BaseParser(multi_gpu=False),
-        parsers.DistributionStrategiesParser(),
         parsers.PerformanceParser(num_parallel_calls=False),
         parsers.ImageModelParser(),
         parsers.ExportParser(),
